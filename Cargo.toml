@@ -13,7 +13,7 @@ name = "f50mgr"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "=1.0.103"
+anyhow = "=1.0.104"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
