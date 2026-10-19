@@ -541,7 +541,7 @@ fn key(name: &str) -> Value {
     Value::String(name.to_owned())
 }
 
-pub(super) fn with_config_write_lock<T>(
+pub(crate) fn with_config_write_lock<T>(
     output: &Path,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {

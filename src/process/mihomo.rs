@@ -571,6 +571,16 @@ pub(crate) fn update_bool_config(
         fs::create_dir_all(parent)
             .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
     }
+    // Mihomo / EasyTier 开关和订阅导入都会写配置目录：共用配置写锁，
+    // 避免并发读-改-写互相覆盖另一边的开关（#11）。
+    crate::subscription::with_config_write_lock(Path::new(path), || {
+        update_bool_config_unlocked(path, section, key, enabled)
+    })
+}
+
+fn update_bool_config_unlocked(path: &str, section: &str, key: &str, enabled: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let original = fs::read_to_string(path).unwrap_or_default();
     let mut output = Vec::<String>::new();
     let mut in_section = false;
@@ -614,8 +624,18 @@ pub(crate) fn update_bool_config(
         output.push(format!("{key} = {value}"));
     }
 
-    fs::write(path, format!("{}\n", output.join("\n")))
-        .with_context(|| format!("写入配置文件失败: {path}"))
+    // 原子替换：watchdog 不会读到写了一半的文件。write_atomic 固定 0600，
+    // 这里恢复原权限（customize.sh 把 f50mgr.toml 设为 644）。
+    let mode = fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
+    crate::subscription::write_atomic(
+        Path::new(path),
+        format!("{}\n", output.join("\n")).as_bytes(),
+    )
+    .with_context(|| format!("写入配置文件失败: {path}"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("恢复配置文件权限失败: {path}"))
 }
 
 fn missing_prerequisite(paths: &Paths) -> Option<&Path> {
@@ -1351,5 +1371,70 @@ mod tests {
 
     fn sh_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn concurrent_toggles_keep_both_sections() -> Result<()> {
+        // #11：Mihomo / EasyTier 开关并发写同一个 f50mgr.toml，不得互相覆盖
+        use std::sync::{Arc, Barrier};
+
+        let root = env::temp_dir().join(format!("f50mgr-toggle-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        let path = root.join("f50mgr.toml");
+        let path = path.to_str().context("临时路径不是 UTF-8")?.to_owned();
+        for round in 0..200 {
+            fs::write(
+                &path,
+                "[mihomo]\nauto_start = false\n\n[easytier]\nenabled = false\n",
+            )?;
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = [("mihomo", "auto_start"), ("easytier", "enabled")]
+                .into_iter()
+                .map(|(section, key)| {
+                    let barrier = Arc::clone(&barrier);
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        update_bool_config(&path, section, key, true)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("并发切换线程 panic"))??;
+            }
+            let after = fs::read_to_string(&path)?;
+            if !after.contains("[mihomo]\nauto_start = true")
+                || !after.contains("[easytier]\nenabled = true")
+            {
+                let _ = fs::remove_dir_all(&root);
+                bail!("第 {round} 轮并发切换后丢失了另一边的开关:\n{after}");
+            }
+        }
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn toggle_keeps_config_file_mode() -> Result<()> {
+        let root = env::temp_dir().join(format!("f50mgr-toggle-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        let path = root.join("f50mgr.toml");
+        fs::write(&path, "[mihomo]\nauto_start = true\n")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        let path_str = path.to_str().context("临时路径不是 UTF-8")?;
+
+        update_bool_config(path_str, "easytier", "enabled", true)?;
+
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::read_to_string(&path)?,
+            "[mihomo]\nauto_start = true\n\n[easytier]\nenabled = true\n"
+        );
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 }
