@@ -150,7 +150,8 @@ fn parse_secrets(content: &str) -> Result<EasyTierSecrets> {
 
         if peers_collecting {
             peers_buf.push_str(line);
-            if line.contains(']') {
+            // 只认引号外的 `]`：IPv6 字面量 peer（tcp://[2001:db8::1]:11010）里也有 `]`
+            if find_unquoted(line, ']').is_some() {
                 peers.extend(parse_inline_string_array(&peers_buf)?);
                 peers_buf.clear();
                 peers_collecting = false;
@@ -165,9 +166,9 @@ fn parse_secrets(content: &str) -> Result<EasyTierSecrets> {
         let value = value.trim();
 
         if key == "peers" {
-            if let Some(stripped) = value.strip_prefix('[') {
-                if let Some(closed) = stripped.strip_suffix(']') {
-                    peers.extend(parse_inline_string_array(&format!("[{closed}]"))?);
+            if value.starts_with('[') {
+                if find_unquoted(value, ']').is_some() {
+                    peers.extend(parse_inline_string_array(value)?);
                 } else {
                     peers_collecting = true;
                     peers_buf.clear();
@@ -212,7 +213,7 @@ fn parse_inline_string_array(text: &str) -> Result<Vec<String>> {
         .and_then(|s| s.strip_suffix(']'))
         .context("数组语法错误，缺少 [ 或 ]")?;
     let mut out = Vec::new();
-    for raw in body.split(',') {
+    for raw in split_unquoted(body, ',') {
         let item = strip_comment(raw).trim();
         if item.is_empty() {
             continue;
@@ -251,8 +252,40 @@ fn parse_toml_string(value: &str) -> Result<String> {
     }
 }
 
+/// 去掉行尾注释；引号内的 `#` 属于值本身（例如 network_secret = "abc#def"）。
 fn strip_comment(line: &str) -> &str {
-    line.split_once('#').map(|(s, _)| s).unwrap_or(line)
+    find_unquoted(line, '#').map_or(line, |idx| &line[..idx])
+}
+
+/// 返回第一个位于引号外的 `target` 的字节下标。
+/// 认识 parse_toml_string 支持的两种字符串：基础字符串 "..."（含反斜杠转义）和字面量 '...'。
+fn find_unquoted(text: &str, target: char) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, c) in text.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == target => return Some(idx),
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None => {}
+        }
+    }
+    None
+}
+
+/// 按引号外的 `sep` 切分。
+fn split_unquoted(text: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(idx) = find_unquoted(rest, sep) {
+        parts.push(&rest[..idx]);
+        rest = &rest[idx + sep.len_utf8()..];
+    }
+    parts.push(rest);
+    parts
 }
 
 fn toml_string(value: &str) -> String {
@@ -360,13 +393,7 @@ pub fn write_secrets(payload: SecretsInput) -> Result<()> {
         };
 
         // 保留旧 secret（如果存在且 payload 里没新值）
-        let preserved_secret = if payload.network_secret.as_deref().unwrap_or("").is_empty()
-            && has_easytier_section(&original)
-        {
-            parse_secrets(&original).ok().map(|s| s.network_secret).unwrap_or_default()
-        } else {
-            payload.network_secret.unwrap_or_default()
-        };
+        let preserved_secret = resolve_network_secret(&original, payload.network_secret)?;
 
         let new_section = render_easytier_section(&SecretsSection {
             network_name: payload.network_name,
@@ -380,6 +407,18 @@ pub fn write_secrets(payload: SecretsInput) -> Result<()> {
         let merged = replace_or_append_easytier_section(&original, &new_section);
         super::write_atomic(Path::new(SECRETS_FILE), merged.as_bytes())
     })
+}
+
+/// payload 没带新 secret 时沿用 `original` 里的旧值。
+/// 旧段解析失败时直接报错：不能把「读不出来」当成「没有旧值」，否则会把 network_secret 写空。
+fn resolve_network_secret(original: &str, new_secret: Option<String>) -> Result<String> {
+    if new_secret.as_deref().unwrap_or("").is_empty() && has_easytier_section(original) {
+        let previous = parse_secrets(original)
+            .context("现有 secrets.toml [easytier] 段无法解析，为避免清空 network_secret 已拒绝保存；请重新填写 network_secret")?;
+        Ok(previous.network_secret)
+    } else {
+        Ok(new_secret.unwrap_or_default())
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -728,6 +767,87 @@ peers = []
         assert!(has_easytier_section("[other]\nfoo=1\n[easytier]\nx=1\n"));
         assert!(!has_easytier_section("[other]\nfoo=1\n"));
         assert!(!has_easytier_section("# [easytier] in comment\n"));
+    }
+
+    fn section_with(network_secret: &str, peers: &[&str]) -> SecretsSection {
+        SecretsSection {
+            network_name: "team#1".into(),
+            network_secret: network_secret.into(),
+            ipv4: "10.0.5.7".into(),
+            instance_id: None,
+            instance_name: None,
+            hostname: Some("f50#lab".into()),
+            peers: peers.iter().map(|p| (*p).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn parse_secrets_roundtrips_ipv6_literal_peers() -> Result<()> {
+        // #16：多行 peers 里 IPv6 字面量的 `]` 不能被当成数组结束
+        let peers = [
+            "tcp://[2001:db8::1]:11010",
+            "udp://[2001:db8::2]:11010/",
+            "tcp://1.2.3.4:11010/",
+        ];
+        let mut section = section_with("s3cret", &peers);
+        section.network_name = "team".into();
+        section.hostname = None;
+        let parsed = parse_secrets(&render_easytier_section(&section))?;
+        assert_eq!(parsed.peers, peers);
+        assert_eq!(parsed.network_secret, "s3cret");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_secrets_roundtrips_hash_inside_quoted_values() -> Result<()> {
+        // #10：引号内的 `#` 不是注释
+        let rendered = render_easytier_section(&section_with("abc#def", &["tcp://h.example:1/#x"]));
+        let parsed = parse_secrets(&rendered)?;
+        assert_eq!(parsed.network_secret, "abc#def");
+        assert_eq!(parsed.network_name, "team#1");
+        assert_eq!(parsed.hostname.as_deref(), Some("f50#lab"));
+        assert_eq!(parsed.peers, vec!["tcp://h.example:1/#x"]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_secrets_still_strips_trailing_comments() -> Result<()> {
+        let raw = "[easytier] # mesh\nnetwork_name = \"team\" # 名称\nnetwork_secret = 'a#b' # 字面量\nipv4 = \"10.0.5.3\"\npeers = [ # 列表\n  \"tcp://[::1]:11010\", # v6\n  \"tcp://a,b:1\",\n] # end\n";
+        let parsed = parse_secrets(raw)?;
+        assert_eq!(parsed.network_name, "team");
+        assert_eq!(parsed.network_secret, "a#b");
+        assert_eq!(parsed.peers, vec!["tcp://[::1]:11010", "tcp://a,b:1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn resave_without_secret_keeps_secret_with_ipv6_peer_and_hash() -> Result<()> {
+        // #10 / #16：只改 peers 再保存（payload 不带 secret）时，旧 secret 不能被写空
+        let original = format!(
+            "[subscription]\nurl = \"https://x\"\n\n{}",
+            render_easytier_section(&section_with("abc#def", &["tcp://[2001:db8::1]:11010"]))
+        );
+        assert_eq!(resolve_network_secret(&original, None)?, "abc#def");
+        assert_eq!(
+            resolve_network_secret(&original, Some(String::new()))?,
+            "abc#def"
+        );
+        assert_eq!(
+            resolve_network_secret(&original, Some("new".into()))?,
+            "new"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resave_without_secret_refuses_to_blank_unparseable_secret() {
+        // 旧段无法解析时必须报错，而不是把 network_secret 当成空串写回
+        let original = "[easytier]\nnetwork_name = \"team\"\nnetwork_secret = \"keep\"\nipv4 = \"10.0.5.3\"\npeers = [\n";
+        assert!(resolve_network_secret(original, None).is_err());
+        assert_eq!(
+            resolve_network_secret(original, Some("new".into())).unwrap(),
+            "new"
+        );
     }
 
     #[test]
